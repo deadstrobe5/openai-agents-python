@@ -46,17 +46,27 @@ from agents._tool_invocation import (
 )
 from agents.editor import ApplyPatchOperation, ApplyPatchResult
 from agents.exceptions import ModelBehaviorError, UserError
-from agents.items import ModelResponse, ToolApprovalItem, TResponseOutputItem
+from agents.items import (
+    ModelResponse,
+    ToolApprovalItem,
+    ToolCallItem,
+    ToolCallOutputItem,
+    TResponseOutputItem,
+)
 from agents.lifecycle import RunHooks
 from agents.models.interface import Model, ModelProvider
 from agents.run_context import RunContextWrapper
 from agents.run_internal.run_loop import ToolRunFunction
+from agents.run_internal.run_steps import ProcessedResponse
 from agents.run_internal.tool_execution import (
     collect_manual_mcp_approvals,
     process_hosted_mcp_approvals,
     resolve_approval_rejection_message,
 )
-from agents.run_internal.tool_planning import _collect_runs_by_approval
+from agents.run_internal.tool_planning import (
+    _collect_runs_by_approval,
+    _dedupe_processed_response_invocations,
+)
 from agents.run_state import RunState
 from agents.stream_events import RunItemStreamEvent
 from agents.testing import ScriptedModel
@@ -3235,3 +3245,57 @@ def test_sticky_hosted_mcp_approval_rejects_same_id_for_changed_tool_name() -> N
 
     assert same_appended == []
     assert changed_appended == []
+
+
+@pytest.mark.parametrize(
+    ("second_arguments", "should_raise"),
+    [('{ "value" : "safe" }', False), ('{"value":"changed"}', True)],
+    ids=["same_invocation", "changed_invocation"],
+)
+def test_history_call_id_reuse_is_checked_without_current_response_call(
+    second_arguments: str,
+    should_raise: bool,
+) -> None:
+    agent = Agent(name="agent")
+    output = {"type": "function_call_output", "call_id": "call_0", "output": "ok"}
+    existing_items: list[Any] = [
+        ToolCallItem(
+            agent=agent,
+            raw_item=cast(
+                Any, get_function_tool_call("record_value", '{"value":"safe"}', call_id="call_0")
+            ),
+        ),
+        ToolCallOutputItem(agent=agent, raw_item=cast(Any, output), output="ok"),
+        ToolCallItem(
+            agent=agent,
+            raw_item=cast(
+                Any, get_function_tool_call("record_value", second_arguments, call_id="call_0")
+            ),
+        ),
+        ToolCallOutputItem(agent=agent, raw_item=cast(Any, dict(output)), output="ok"),
+    ]
+    processed_response = ProcessedResponse(
+        new_items=[],
+        handoffs=[],
+        functions=[],
+        computer_actions=[],
+        local_shell_calls=[],
+        shell_calls=[],
+        apply_patch_calls=[],
+        tools_used=[],
+        mcp_approval_requests=[],
+        interruptions=[],
+    )
+
+    def dedupe() -> None:
+        _dedupe_processed_response_invocations(
+            processed_response,
+            context_wrapper=RunContextWrapper(context=None),
+            existing_items=existing_items,
+        )
+
+    if should_raise:
+        with pytest.raises(ModelBehaviorError, match="Run history reused a tool call ID"):
+            dedupe()
+    else:
+        dedupe()
